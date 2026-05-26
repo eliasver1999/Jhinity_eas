@@ -39,6 +39,12 @@ export default async function AppLayout({ children }: { children: React.ReactNod
               >
                 Team
               </Link>
+              <Link
+                href="/settings/devices"
+                className="hover:text-neutral-900 dark:hover:text-neutral-100"
+              >
+                Devices
+              </Link>
             </nav>
           </div>
           <div className="flex items-center gap-3 text-sm">

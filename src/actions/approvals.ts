@@ -10,12 +10,65 @@ import {
   approvalPolicies,
   approvalRequests,
   approverRole as approverRoleEnum,
+  chatConnections,
   easConnections,
+  type ChatProvider,
 } from "@/db/schema";
 import { auth } from "@/auth";
 import { getActiveOrg } from "@/lib/org";
 import { decrypt } from "@/lib/encryption";
 import { fetchRecentBuilds, EasError } from "@/lib/eas";
+import { buildApprovalMessage, buildDecisionMessage, postChatWebhook } from "@/lib/chat";
+
+// ---- Shared chat notify helper ---------------------------------------------
+
+type ChatTarget = { id: string; provider: ChatProvider; url: string };
+
+async function loadChatTargets(orgId: string): Promise<ChatTarget[]> {
+  const rows = await db
+    .select()
+    .from(chatConnections)
+    .where(eq(chatConnections.organizationId, orgId));
+  const out: ChatTarget[] = [];
+  for (const c of rows) {
+    try {
+      out.push({
+        id: c.id,
+        provider: c.provider as ChatProvider,
+        url: decrypt({
+          ciphertext: c.webhookCiphertext,
+          iv: c.webhookIv,
+          authTag: c.webhookAuthTag,
+        }),
+      });
+    } catch (e) {
+      console.warn(`[chat] failed to decrypt ${c.provider} webhook`, e);
+    }
+  }
+  return out;
+}
+
+function selectTargets(
+  all: ChatTarget[],
+  policyChatConnectionId: string | null,
+): ChatTarget[] {
+  if (!policyChatConnectionId) return all;
+  const t = all.find((x) => x.id === policyChatConnectionId);
+  return t ? [t] : [];
+}
+
+async function postToTargets(
+  targets: ChatTarget[],
+  build: (provider: ChatProvider) => Record<string, unknown>,
+) {
+  for (const target of targets) {
+    try {
+      await postChatWebhook(target.url, build(target.provider));
+    } catch (e) {
+      console.warn(`[chat] ${target.provider} notify failed`, e);
+    }
+  }
+}
 
 // ---- Sync builds → approval_requests ---------------------------------------
 
@@ -67,10 +120,16 @@ export async function syncBuildsAction(
   if (policies.length === 0) return { created: 0 };
   const byProfile = new Map(policies.map((p) => [p.buildProfile, p]));
 
+  // Pull all chat webhooks once so we don't re-load per iteration.
+  const chatTargets = await loadChatTargets(org.id);
+
+  const appUrl = process.env.APP_URL ?? "http://localhost:3000";
+
   let created = 0;
   for (const b of builds) {
-    if (!b.buildProfile) continue;
-    const policy = byProfile.get(b.buildProfile);
+    const buildProfile = b.buildProfile;
+    if (!buildProfile) continue;
+    const policy = byProfile.get(buildProfile);
     if (!policy) continue;
 
     const inserted = await db
@@ -78,7 +137,7 @@ export async function syncBuildsAction(
       .values({
         organizationId: org.id,
         buildId: b.id,
-        buildProfile: b.buildProfile,
+        buildProfile,
         appName: b.appName,
         appSlug: b.appSlug,
         platform: b.platform,
@@ -102,6 +161,23 @@ export async function syncBuildsAction(
         userId: session.user.id,
         type: "created",
       });
+
+      const routed = selectTargets(chatTargets, policy.chatConnectionId);
+      await postToTargets(routed, (provider) =>
+        buildApprovalMessage(provider, {
+          approvalRequestId: inserted[0].id,
+          orgName: org.name,
+          appName: b.appName,
+          appSlug: b.appSlug,
+          buildProfile,
+          platform: b.platform,
+          gitCommitHash: b.gitCommitHash,
+          gitCommitMessage: b.gitCommitMessage,
+          initiatingActor: b.initiatingActor,
+          required: policy.requiredApprovals,
+          appUrl,
+        }),
+      );
     }
   }
 
@@ -130,7 +206,7 @@ async function loadRequestForDecision(orgId: string, requestId: string) {
   return req;
 }
 
-async function userCanApprove(orgRole: string, buildProfile: string, orgId: string) {
+async function loadPolicyForRequest(orgId: string, buildProfile: string) {
   const [policy] = await db
     .select()
     .from(approvalPolicies)
@@ -141,9 +217,12 @@ async function userCanApprove(orgRole: string, buildProfile: string, orgId: stri
       ),
     )
     .limit(1);
-  if (!policy) return false;
-  if (policy.approverRole === "owner") return orgRole === "owner";
-  return orgRole === "owner" || orgRole === "admin";
+  return policy ?? null;
+}
+
+function canDecide(role: string, policyApproverRole: string) {
+  if (policyApproverRole === "owner") return role === "owner";
+  return role === "owner" || role === "admin";
 }
 
 async function recomputeApprovalCount(requestId: string): Promise<number> {
@@ -170,7 +249,9 @@ export async function approveAction(requestId: string, formData: FormData) {
   if (!req) throw new Error("Approval request not found");
   if (req.status !== "pending") throw new Error("This request is already resolved");
 
-  if (!(await userCanApprove(org.role, req.buildProfile, org.id))) {
+  const policy = await loadPolicyForRequest(org.id, req.buildProfile);
+  if (!policy) throw new Error("This build profile no longer has an active policy.");
+  if (!canDecide(org.role, policy.approverRole)) {
     throw new Error("You don't have permission to approve this build profile");
   }
 
@@ -199,6 +280,36 @@ export async function approveAction(requestId: string, formData: FormData) {
     })
     .where(eq(approvalRequests.id, req.id));
 
+  // Notify chat only on the transition to "approved" (the last needed
+  // approval). Per-vote pings would be noisy.
+  if (becameApproved) {
+    const appUrl = process.env.APP_URL ?? "http://localhost:3000";
+    const decidedBy = session.user.name ?? session.user.email ?? "Someone";
+    const all = await loadChatTargets(org.id);
+    const routed = selectTargets(all, policy.chatConnectionId);
+    await postToTargets(routed, (provider) =>
+      buildDecisionMessage(
+        provider,
+        {
+          approvalRequestId: req.id,
+          orgName: org.name,
+          appName: req.appName,
+          appSlug: req.appSlug,
+          buildProfile: req.buildProfile,
+          platform: req.platform,
+          gitCommitHash: req.gitCommitHash,
+          gitCommitMessage: req.gitCommitMessage,
+          decidedBy,
+          comment: parsed.data.comment ?? null,
+          approvalCount: count,
+          requiredApprovals: req.requiredApprovals,
+          appUrl,
+        },
+        "approved",
+      ),
+    );
+  }
+
   revalidatePath("/approvals");
   revalidatePath(`/approvals/${req.id}`);
   revalidatePath("/dashboard");
@@ -215,7 +326,9 @@ export async function rejectAction(requestId: string, formData: FormData) {
   if (!req) throw new Error("Approval request not found");
   if (req.status !== "pending") throw new Error("This request is already resolved");
 
-  if (!(await userCanApprove(org.role, req.buildProfile, org.id))) {
+  const policy = await loadPolicyForRequest(org.id, req.buildProfile);
+  if (!policy) throw new Error("This build profile no longer has an active policy.");
+  if (!canDecide(org.role, policy.approverRole)) {
     throw new Error("You don't have permission to reject this build profile");
   }
 
@@ -238,6 +351,33 @@ export async function rejectAction(requestId: string, formData: FormData) {
     .set({ status: "rejected", updatedAt: new Date() })
     .where(eq(approvalRequests.id, req.id));
 
+  // Single reject is terminal — always notify.
+  const appUrl = process.env.APP_URL ?? "http://localhost:3000";
+  const decidedBy = session.user.name ?? session.user.email ?? "Someone";
+  const all = await loadChatTargets(org.id);
+  const routed = selectTargets(all, policy.chatConnectionId);
+  await postToTargets(routed, (provider) =>
+    buildDecisionMessage(
+      provider,
+      {
+        approvalRequestId: req.id,
+        orgName: org.name,
+        appName: req.appName,
+        appSlug: req.appSlug,
+        buildProfile: req.buildProfile,
+        platform: req.platform,
+        gitCommitHash: req.gitCommitHash,
+        gitCommitMessage: req.gitCommitMessage,
+        decidedBy,
+        comment: parsed.data.comment ?? null,
+        approvalCount: req.approvalCount,
+        requiredApprovals: req.requiredApprovals,
+        appUrl,
+      },
+      "rejected",
+    ),
+  );
+
   revalidatePath("/approvals");
   revalidatePath(`/approvals/${req.id}`);
   revalidatePath("/dashboard");
@@ -254,6 +394,12 @@ const policySchema = z.object({
     .regex(/^[a-zA-Z0-9._-]+$/, "Use letters, numbers, dot, dash, underscore"),
   requiredApprovals: z.coerce.number().int().min(1).max(20),
   approverRole: z.enum(approverRoleEnum),
+  chatConnectionId: z
+    .string()
+    .trim()
+    .transform((v) => (v === "" ? null : v))
+    .nullable()
+    .optional(),
 });
 
 export async function createPolicyAction(formData: FormData) {
@@ -270,8 +416,26 @@ export async function createPolicyAction(formData: FormData) {
     buildProfile: formData.get("buildProfile"),
     requiredApprovals: formData.get("requiredApprovals"),
     approverRole: formData.get("approverRole"),
+    chatConnectionId: formData.get("chatConnectionId"),
   });
   if (!parsed.success) throw new Error(parsed.error.errors[0]?.message ?? "Invalid policy");
+
+  // If a chat connection was picked, verify it belongs to this org. Prevents
+  // cross-tenant assignment via a forged form post.
+  let chatConnectionId: string | null = parsed.data.chatConnectionId ?? null;
+  if (chatConnectionId) {
+    const [owned] = await db
+      .select({ id: chatConnections.id })
+      .from(chatConnections)
+      .where(
+        and(
+          eq(chatConnections.id, chatConnectionId),
+          eq(chatConnections.organizationId, org.id),
+        ),
+      )
+      .limit(1);
+    if (!owned) throw new Error("Selected chat channel doesn't belong to this org");
+  }
 
   await db
     .insert(approvalPolicies)
@@ -280,12 +444,14 @@ export async function createPolicyAction(formData: FormData) {
       buildProfile: parsed.data.buildProfile,
       requiredApprovals: parsed.data.requiredApprovals,
       approverRole: parsed.data.approverRole,
+      chatConnectionId,
     })
     .onConflictDoUpdate({
       target: [approvalPolicies.organizationId, approvalPolicies.buildProfile],
       set: {
         requiredApprovals: parsed.data.requiredApprovals,
         approverRole: parsed.data.approverRole,
+        chatConnectionId,
       },
     });
 

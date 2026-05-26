@@ -113,6 +113,55 @@ export const easConnections = pgTable(
   (t) => [unique("eas_connections_org_unique").on(t.organizationId)],
 );
 
+// -------- Mobile / programmatic API tokens --------
+
+export const apiTokens = pgTable(
+  "api_tokens",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    lastUsedAt: timestamp("last_used_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [unique("api_tokens_hash_unique").on(t.tokenHash)],
+);
+
+// -------- Chat notifications (Slack / Discord webhooks) --------
+
+export const chatProvider = ["slack", "discord"] as const;
+export type ChatProvider = (typeof chatProvider)[number];
+
+export const chatConnections = pgTable(
+  "chat_connections",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    provider: text("provider", { enum: chatProvider }).notNull(),
+    channelLabel: text("channel_label"), // user-supplied label, e.g. "#releases"
+    webhookCiphertext: text("webhook_ciphertext").notNull(),
+    webhookIv: text("webhook_iv").notNull(),
+    webhookAuthTag: text("webhook_auth_tag").notNull(),
+    addedByUserId: text("added_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [unique("chat_connections_org_provider_unique").on(t.organizationId, t.provider)],
+);
+
 // -------- Approval gating --------
 
 export const approverRole = ["owner", "admin"] as const;
@@ -132,6 +181,11 @@ export const approvalPolicies = pgTable(
     approverRole: text("approver_role", { enum: approverRole })
       .notNull()
       .default("admin"),
+    // null = broadcast to every connected chat target on sync;
+    // set = route only to that connection.
+    chatConnectionId: text("chat_connection_id").references(() => chatConnections.id, {
+      onDelete: "set null",
+    }),
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [

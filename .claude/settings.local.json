@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --version)",
+      "Bash(npm install *)",
+      "Bash(DATABASE_URL=\"postgres://x:x@localhost/x\" npx drizzle-kit generate)",
+      "Read(//c/Program Files/PostgreSQL//**)",
+      "Read(//c/Program Files/PostgreSQL/**)",
+      "Bash(node -e \"console.log\\(require\\('crypto'\\).randomBytes\\(32\\).toString\\('base64'\\)\\)\")",
+      "Bash(npm run *)"
+    ]
+  }
+}

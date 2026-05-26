@@ -12,7 +12,8 @@
       "Bash(npx drizzle-kit *)",
       "Bash(\"/c/Program Files/PostgreSQL/18/bin/psql.exe\" -U postgres -d eas_dashboard -f drizzle/0004_chat_connections.sql)",
       "Bash(export PGPASSWORD=ver141099)",
-      "Bash(node scripts/fixup-drizzle-meta.mjs)"
+      "Bash(node scripts/fixup-drizzle-meta.mjs)",
+      "Bash(npx expo *)"
     ]
   }
 }
